@@ -1,0 +1,107 @@
+name: Package LifeInstruct for iPad
+run-name: LifeInstruct iPad build ${{ inputs.build }}
+on:
+  workflow_dispatch:
+    inputs:
+      build:
+        type: string
+        required: true
+        default: '1001'
+      source_tag:
+        type: string
+        required: true
+      source_sha256:
+        type: string
+        required: true
+permissions:
+  contents: write
+concurrency:
+  group: lifeinstruct-ipad-build
+  cancel-in-progress: false
+jobs:
+  package:
+    runs-on: macos-15
+    timeout-minutes: 30
+    env:
+      GH_TOKEN: ${{ github.token }}
+      LIFE_BUILD: ${{ inputs.build }}
+      LIFE_SOURCE_TAG: ${{ inputs.source_tag }}
+      LIFE_SOURCE_SHA256: ${{ inputs.source_sha256 }}
+    steps:
+      - name: Read verified compiled app input
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$LIFE_BUILD" =~ ^[0-9]+$ ]]
+          [[ "$LIFE_SOURCE_TAG" =~ ^[A-Za-z0-9_.-]+$ ]]
+          [[ "$LIFE_SOURCE_SHA256" =~ ^[a-f0-9]{64}$ ]]
+          gh release download "$LIFE_SOURCE_TAG" --repo "$GITHUB_REPOSITORY" --pattern compiled-input.zip --output "$RUNNER_TEMP/compiled-input.zip"
+          echo "$LIFE_SOURCE_SHA256  $RUNNER_TEMP/compiled-input.zip" | shasum -a 256 --check
+          unzip -q "$RUNNER_TEMP/compiled-input.zip" -d .
+      - name: Package the unsigned native iPad app
+        shell: bash
+        run: |
+          set -euo pipefail
+          export LIFE_VERSION=$(node -p 'JSON.parse(require("fs").readFileSync("build-input.json")).version')
+          export SOURCE_ROOT="$PWD"
+          export NATIVE="$RUNNER_TEMP/lifeinstruct-ipad"
+          mkdir -p "$NATIVE"
+          cp -R dist "$NATIVE/dist"
+          cd "$NATIVE"
+          python3 - <<'PY'
+          from pathlib import Path
+          import os,json
+          path=Path('dist/index.html')
+          text=path.read_text()
+          assert text.count('<head>')==1
+          script='<script>window.__LIFEINSTRUCT_BUILD__='+str(int(os.environ['LIFE_BUILD']))+';window.__LIFEINSTRUCT_VERSION__='+json.dumps(os.environ['LIFE_VERSION'])+';</script>'
+          path.write_text(text.replace('<head>','<head>'+script,1))
+          Path('package.json').write_text(json.dumps({'name':'lifeinstruct-native','private':True,'dependencies':{'@capacitor/core':'8.5.3','@capacitor/cli':'8.5.3','@capacitor/ios':'8.5.3'}}))
+          Path('capacitor.config.json').write_text(json.dumps({'appId':'com.benighter.lifeinstruct','appName':'LifeInstruct Bible','webDir':'dist','ios':{'backgroundColor':'#ffffff','preferredContentMode':'recommended'},'plugins':{'SplashScreen':{'launchShowDuration':0}}}))
+          PY
+          npm install --no-audit --no-fund
+          export DEVELOPER_DIR=$(python3 - <<'PY'
+          import plistlib,re
+          from pathlib import Path
+          choices=[]
+          for app in Path('/Applications').glob('Xcode*.app'):
+            version=plistlib.loads((app/'Contents/Info.plist').read_bytes())['CFBundleShortVersionString']
+            numbers=tuple(int(v) for v in re.findall(r'\d+',version))
+            if numbers[0]>=26: choices.append(('beta' not in app.name.lower(),numbers,str(app/'Contents/Developer')))
+          if not choices: raise SystemExit('Xcode 26 or newer is required')
+          print(max(choices)[2])
+          PY
+          )
+          npx cap add ios
+          python3 "$SOURCE_ROOT/scripts/prepare-ios.py" "$NATIVE"
+          python3 -m pip install --quiet --disable-pip-version-check --no-deps --target "$RUNNER_TEMP/lifeinstruct-image-tools" Pillow==13.0.0
+          PYTHONPATH="$RUNNER_TEMP/lifeinstruct-image-tools" python3 - <<'PY'
+          from pathlib import Path
+          import json
+          from PIL import Image
+          image=Image.open('dist/logo.png').convert('RGB').resize((1024,1024),Image.Resampling.LANCZOS)
+          folder=Path('ios/App/App/Assets.xcassets/AppIcon.appiconset')
+          image.save(folder/'LifeInstruct.png')
+          (folder/'Contents.json').write_text(json.dumps({'images':[{'filename':'LifeInstruct.png','idiom':'universal','platform':'ios','size':'1024x1024'}],'info':{'author':'xcode','version':1}}))
+          PY
+          xcodebuild -project ios/App/App.xcodeproj -scheme App -configuration Release -destination 'generic/platform=iOS' -derivedDataPath build CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY='' MARKETING_VERSION="$LIFE_VERSION" CURRENT_PROJECT_VERSION="$LIFE_BUILD" build > xcode-build.log 2>&1 || { gh release upload "$LIFE_SOURCE_TAG" xcode-build.log --clobber --repo "$GITHUB_REPOSITORY"; echo "Native packaging failed; diagnostic retained in the private input draft."; exit 1; }
+          APP=build/Build/Products/Release-iphoneos/App.app
+          test "$(/usr/libexec/PlistBuddy -c 'Print CFBundleIdentifier' "$APP/Info.plist")" = com.benighter.lifeinstruct
+          test "$(/usr/libexec/PlistBuddy -c 'Print CFBundleVersion' "$APP/Info.plist")" = "$LIFE_BUILD"
+          file "$APP/App" | grep -q arm64
+          mkdir Payload
+          ditto "$APP" Payload/LifeInstruct.app
+          PACKAGE="LifeInstruct-$LIFE_VERSION-iPad-b$LIFE_BUILD-unsigned.ipa"
+          ditto -c -k --sequesterRsrc --keepParent Payload "$PACKAGE"
+          export PACKAGE
+          python3 - <<'PY'
+          from pathlib import Path
+          import json,hashlib,os
+          package=Path(os.environ['PACKAGE'])
+          proof={'version':os.environ['LIFE_VERSION'],'build':int(os.environ['LIFE_BUILD']),'bundleId':'com.benighter.lifeinstruct','size':package.stat().st_size,'sha256':hashlib.sha256(package.read_bytes()).hexdigest(),'unsigned':True,'workflowCommit':os.environ['GITHUB_SHA'],'compiledInputSha256':os.environ['LIFE_SOURCE_SHA256'],'bibleBooks':66,'offlineTranslations':['KJV','WEB']}
+          Path('IPAD-BUILD.json').write_text(json.dumps(proof,indent=2)+'\n')
+          Path('SHA256SUMS.txt').write_text(proof['sha256']+'  '+package.name+'\n')
+          PY
+          TAG="ipad-v$LIFE_VERSION-b$LIFE_BUILD"
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --draft --title "LifeInstruct iPad build $LIFE_BUILD" --notes 'Private unsigned iPad build. Owner signing is required before installation.'
+          gh release upload "$TAG" "$PACKAGE" IPAD-BUILD.json SHA256SUMS.txt --repo "$GITHUB_REPOSITORY"
